@@ -8,7 +8,7 @@ Backend FastAPI kết nối ứng dụng Nghe Nói Video với Groq mà không �
 - `POST /transcribe` (tệp multipart hoặc URL trực tiếp trong JSON)
 - `POST /evaluate-translation`
 
-URL YouTube/Vimeo không phải liên kết media trực tiếp nên backend chủ động từ chối. Hãy dùng phụ đề hoặc tải lên tệp mà bạn có quyền sử dụng.
+Backend có thể lấy luồng âm thanh từ video YouTube/Vimeo công khai bằng `yt-dlp`, sau đó gửi âm thanh tới Groq để phiên âm. Nguồn riêng tư, cần đăng nhập, giới hạn vùng hoặc DRM không được vượt qua.
 
 ## Chạy cục bộ
 
@@ -38,4 +38,4 @@ Trong web Nghe Nói Video, điền:
 - URL backend AI: URL Render, không thêm `/health`
 - Model nhận diện: `whisper-large-v3-turbo`
 - Model đánh giá bản dịch: `openai/gpt-oss-20b`
-- Cách gửi dữ liệu: `Cho phép backend tải URL nguồn` nếu dùng URL trực tiếp đến MP4/MP3
+- Cách gửi dữ liệu: `Cho phép backend tải URL nguồn` nếu dùng URL YouTube/Vimeo hoặc URL trực tiếp đến MP4/MP3

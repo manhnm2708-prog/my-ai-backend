@@ -1,13 +1,16 @@
 import asyncio
 import ipaddress
 import json
+import mimetypes
 import os
 import socket
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
+import yt_dlp
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -186,7 +189,107 @@ async def _download_direct_media(source_url: str) -> tuple[str, bytes, str]:
         raise HTTPException(status_code=400, detail="URL nguồn chuyển hướng quá nhiều lần.")
 
 
-async def _transcribe_media(filename: str, content: bytes, content_type: str, model: str, language: str) -> dict[str, Any]:
+def _download_platform_media_sync(source_url: str) -> tuple[str, bytes, str]:
+    """Download one public YouTube/Vimeo audio stream without cookies or DRM bypass."""
+    with tempfile.TemporaryDirectory(prefix="nghenoi-") as temp_dir:
+        output_template = str(Path(temp_dir) / "source.%(ext)s")
+        options = {
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "outtmpl": output_template,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "restrictfilenames": True,
+            "socket_timeout": 20,
+            "retries": 2,
+            "fragment_retries": 2,
+            "max_filesize": MAX_SOURCE_BYTES,
+            "overwrites": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(options) as downloader:
+                info = downloader.extract_info(source_url, download=True)
+                requested = info.get("requested_downloads") or []
+                candidates = [Path(item.get("filepath", "")) for item in requested if item.get("filepath")]
+                prepared = Path(downloader.prepare_filename(info))
+                candidates.extend([prepared, *Path(temp_dir).glob("source.*")])
+        except yt_dlp.utils.DownloadError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="Không thể lấy âm thanh công khai từ nguồn này. Video có thể riêng tư, giới hạn khu vực, cần đăng nhập hoặc được bảo vệ.",
+            ) from exc
+
+        media_path = next((path for path in candidates if path.is_file()), None)
+        if media_path is None:
+            raise HTTPException(status_code=422, detail="Nguồn không cung cấp luồng âm thanh có thể xử lý.")
+        size = media_path.stat().st_size
+        if size > MAX_SOURCE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Âm thanh vượt giới hạn {MAX_SOURCE_BYTES // (1024 * 1024)} MB. Hãy dùng video ngắn hơn hoặc tải tệp đã nén.",
+            )
+        media_type = mimetypes.guess_type(media_path.name)[0] or "application/octet-stream"
+        return media_path.name, media_path.read_bytes(), media_type
+
+
+async def _download_platform_media(source_url: str) -> tuple[str, bytes, str]:
+    await _validate_public_url(source_url)
+    return await asyncio.to_thread(_download_platform_media_sync, source_url)
+
+
+async def _translate_segments(
+    segments: list[dict[str, Any]], target_language: str, model: str
+) -> list[dict[str, Any]]:
+    if not target_language or not segments:
+        return segments
+    translated = [dict(segment) for segment in segments]
+    headers = {"Authorization": f"Bearer {_api_key()}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        for offset in range(0, len(translated), 40):
+            batch = translated[offset : offset + 40]
+            source_items = [{"id": index, "text": item["text"]} for index, item in enumerate(batch)]
+            payload = {
+                "model": model or DEFAULT_TEXT_MODEL,
+                "temperature": 0.1,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Bạn là dịch giả phụ đề. Dịch tự nhiên, giữ đúng nghĩa và không thêm giải thích. "
+                            "Chỉ trả JSON hợp lệ dạng {\"translations\":[{\"id\":0,\"text\":\"...\"}]}."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Ngôn ngữ đích: {target_language}\nCác câu: {json.dumps(source_items, ensure_ascii=False)}",
+                    },
+                ],
+            }
+            response = await client.post(f"{GROQ_API_BASE}/chat/completions", headers=headers, json=payload)
+            if response.status_code >= 400:
+                raise _groq_error(response)
+            try:
+                content = response.json()["choices"][0]["message"]["content"]
+                items = json.loads(content).get("translations", [])
+            except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+                raise HTTPException(status_code=502, detail="Groq trả về bản dịch phụ đề không hợp lệ.") from exc
+            by_id = {int(item["id"]): str(item["text"]).strip() for item in items if "id" in item and "text" in item}
+            for index, item in enumerate(batch):
+                item["translation"] = by_id.get(index, "")
+    return translated
+
+
+async def _transcribe_media(
+    filename: str,
+    content: bytes,
+    content_type: str,
+    model: str,
+    language: str,
+    target_language: str = "",
+    text_model: str = "",
+) -> dict[str, Any]:
     if not content:
         raise HTTPException(status_code=400, detail="Tệp video/âm thanh rỗng.")
     if len(content) > MAX_SOURCE_BYTES:
@@ -221,6 +324,7 @@ async def _transcribe_media(filename: str, content: bytes, content_type: str, mo
         for segment in result.get("segments", [])
         if str(segment.get("text", "")).strip()
     ]
+    segments = await _translate_segments(segments, target_language, text_model or DEFAULT_TEXT_MODEL)
     return {
         "provider": "groq",
         "model": resolved_model,
@@ -244,6 +348,8 @@ async def transcribe(request: Request) -> dict[str, Any]:
             uploaded.content_type or "application/octet-stream",
             str(form.get("model", "")),
             str(form.get("language", "")),
+            str(form.get("target_language", "")),
+            str(form.get("text_model", "")),
         )
 
     if content_type.startswith("application/json"):
@@ -256,17 +362,17 @@ async def transcribe(request: Request) -> dict[str, Any]:
         source_url = str(body.get("source_url", "")).strip()
         source_type = str(body.get("source_type", "")).lower()
         if source_type in {"youtube", "vimeo"}:
-            raise HTTPException(
-                status_code=422,
-                detail="Backend không vượt cơ chế bảo vệ của YouTube/Vimeo. Hãy dùng phụ đề hoặc tải tệp bạn có quyền sử dụng rồi chọn Tải tệp.",
-            )
-        filename, content, media_type = await _download_direct_media(source_url)
+            filename, content, media_type = await _download_platform_media(source_url)
+        else:
+            filename, content, media_type = await _download_direct_media(source_url)
         return await _transcribe_media(
             filename,
             content,
             media_type,
             str(body.get("model", "")),
             str(body.get("language", "")),
+            str(body.get("target_language", "")),
+            str(body.get("text_model", "")),
         )
 
     raise HTTPException(status_code=415, detail="Chỉ hỗ trợ multipart/form-data hoặc application/json.")
